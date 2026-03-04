@@ -1,0 +1,13 @@
+{
+  "canny_low": 35,
+  "canny_high": 140,
+  "blur_kernel": 5,
+  "min_contour_area_ratio": 0.008,
+  "simplify_epsilon_ratio": 0.012,
+  "max_hole_area_ratio": 0.35,
+  "max_hole_radius_ratio": 0.35,
+  "use_hough_circles": false,
+  "use_adaptive_thresh": true,
+  "adaptive_block": 11,
+  "adaptive_c": 2
+}

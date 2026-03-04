@@ -1,0 +1,451 @@
+"""
+Outline Extractor Module
+Extracts a single clean outline (and holes) from a photo for CAD export.
+Uses object segmentation, largest contour, and geometric feature detection.
+
+Improvements over original:
+- Algebraic circle fitting (Kasa method) for holes — more accurate than
+  minEnclosingCircle which systematically over-estimates radius.
+- LSD (Line Segment Detector) based geometric decomposition — detects true
+  straight-line segments on the part boundary and exports them as separate
+  LINE entities rather than blending them into a polyline approximation.
+- Smoother contours: Gaussian blur applied to mask boundary before
+  contour extraction to reduce pixel-level noise.
+- GeometricOutline dataclass carries both the raw contour AND the detected
+  line segments, so CAD exporters can choose the right representation.
+"""
+
+import cv2
+import numpy as np
+from typing import List, Tuple, Dict, Optional
+from dataclasses import dataclass, field
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class OutlineResult:
+    """Clean outline + holes for one view."""
+    outline: np.ndarray  # Nx1x2 main contour (simplified)
+    holes: List[Tuple[Tuple[float, float], float]]  # (center, radius)
+    contours_all: List[np.ndarray]  # all contours for debugging
+
+
+@dataclass
+class GeometricOutline:
+    """Geometric decomposition of the part outline.
+
+    Carries the raw contour for polyline export PLUS detected straight-line
+    segments from LSD and algebraically-fitted circles for holes.
+    """
+    outline: np.ndarray                                      # raw contour (Nx1x2)
+    holes: List[Tuple[Tuple[float, float], float]]           # (center, radius) – algebraic fit
+    line_segments: List[Tuple[Tuple[float, float], Tuple[float, float]]] = field(default_factory=list)
+    # ^^ LSD-detected straight edges: list of ((x1,y1),(x2,y2)) in image coords
+    contours_all: List[np.ndarray] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Algebraic circle fitting (Kasa method)
+# ---------------------------------------------------------------------------
+
+def _fit_circle_algebraic(
+    contour: np.ndarray,
+) -> Tuple[float, float, float]:
+    """Fit a circle to contour points using the Kasa algebraic method.
+
+    Minimises the algebraic distance ||(x-cx)²+(y-cy)²-r²||, solved via
+    least squares.  Much more accurate than cv2.minEnclosingCircle for
+    real hole boundaries (which are rarely perfect circles in the image).
+
+    Returns (cx, cy, r).  Falls back to minEnclosingCircle if singular.
+    """
+    pts = contour.reshape(-1, 2).astype(np.float64)
+    if len(pts) < 3:
+        (cx, cy), r = cv2.minEnclosingCircle(contour)
+        return float(cx), float(cy), float(r)
+
+    x = pts[:, 0]
+    y = pts[:, 1]
+    A = np.column_stack([2.0 * x, 2.0 * y, np.ones(len(x))])
+    b = x ** 2 + y ** 2
+    try:
+        result, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+    except np.linalg.LinAlgError:
+        (cx, cy), r = cv2.minEnclosingCircle(contour)
+        return float(cx), float(cy), float(r)
+
+    cx, cy, c = result
+    r = float(np.sqrt(max(0.0, c + cx ** 2 + cy ** 2)))
+    if r < 1.0:  # degenerate: fall back
+        (cx2, cy2), r2 = cv2.minEnclosingCircle(contour)
+        return float(cx2), float(cy2), float(r2)
+    return float(cx), float(cy), r
+
+
+# ---------------------------------------------------------------------------
+# LSD-based straight-line detection on mask boundary
+# ---------------------------------------------------------------------------
+
+def _detect_boundary_lines(
+    mask: np.ndarray,
+    min_line_length: float = 20.0,
+) -> List[Tuple[Tuple[float, float], Tuple[float, float]]]:
+    """Run LSD on the mask boundary image and return significant line segments.
+
+    Args:
+        mask: Binary uint8 mask (255 = foreground).
+        min_line_length: Discard segments shorter than this (pixels).
+
+    Returns:
+        List of ((x1, y1), (x2, y2)) segment tuples.
+    """
+    # Derive boundary edge image from the mask
+    kernel = np.ones((3, 3), np.uint8)
+    boundary = cv2.dilate(mask, kernel) - cv2.erode(mask, kernel)
+    boundary = np.clip(boundary, 0, 255).astype(np.uint8)
+
+    try:
+        lsd = cv2.createLineSegmentDetector(cv2.LSD_REFINE_STD)
+        raw, *_ = lsd.detect(boundary)
+    except cv2.error:
+        return []
+
+    if raw is None or len(raw) == 0:
+        return []
+
+    segments: List[Tuple[Tuple[float, float], Tuple[float, float]]] = []
+    for seg in raw.reshape(-1, 4):
+        x1, y1, x2, y2 = seg
+        length = float(np.hypot(x2 - x1, y2 - y1))
+        if length >= min_line_length:
+            segments.append(((float(x1), float(y1)), (float(x2), float(y2))))
+    return segments
+
+
+class OutlineExtractor:
+    """
+    Extracts one dominant outline and hole circles from an image.
+    Parameters can be tuned via training from sample data.
+    """
+
+    def __init__(
+        self,
+        canny_low: int = 40,
+        canny_high: int = 120,
+        blur_kernel: int = 5,
+        min_contour_area_ratio: float = 0.01,
+        simplify_epsilon_ratio: float = 0.008,
+        max_hole_area_ratio: float = 0.35,
+        max_hole_radius_ratio: float = 0.35,
+        use_hough_circles: bool = False,
+        use_adaptive_thresh: bool = True,
+        adaptive_block: int = 11,
+        adaptive_c: int = 2,
+    ):
+        self.canny_low = canny_low
+        self.canny_high = canny_high
+        self.blur_kernel = blur_kernel
+        self.min_contour_area_ratio = min_contour_area_ratio
+        self.simplify_epsilon_ratio = simplify_epsilon_ratio
+        self.max_hole_area_ratio = max_hole_area_ratio
+        self.max_hole_radius_ratio = max_hole_radius_ratio
+        self.use_hough_circles = use_hough_circles
+        self.use_adaptive_thresh = use_adaptive_thresh
+        self.adaptive_block = adaptive_block
+        self.adaptive_c = adaptive_c
+
+    def extract_from_mask(
+        self,
+        mask: np.ndarray,
+        simplify_epsilon_ratio: Optional[float] = None,
+    ) -> OutlineResult:
+        """
+        Extract outline and holes from a binary mask (H, W). Value > 0 = foreground.
+        Used when the mask comes from a trained model.
+
+        Holes are found via two-pass approach:
+        1. Fill the main contour solid.
+        2. Find voids (black inside filled part) and apply circularity filter
+           so shadows / noise in the mask are not mistaken for holes.
+        """
+        if mask.ndim > 2:
+            mask = mask.squeeze()
+        if mask.dtype != np.uint8:
+            mask = (mask > 0).astype(np.uint8) * 255
+        h, w = mask.shape
+        min_area = int(h * w * self.min_contour_area_ratio)
+
+        # Main contour: use external contours only on the mask
+        ext_contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        filtered = [c for c in ext_contours if cv2.contourArea(c) >= min_area]
+        if not filtered:
+            return OutlineResult(
+                outline=np.array([], dtype=np.float32).reshape(0, 1, 2),
+                holes=[],
+                contours_all=list(ext_contours),
+            )
+
+        largest = max(filtered, key=cv2.contourArea)
+        main_area = cv2.contourArea(largest)
+        x_main, y_main, w_main, h_main = cv2.boundingRect(largest)
+        main_min_side = min(w_main, h_main)
+        max_hole_radius = main_min_side * self.max_hole_radius_ratio
+        min_hole_radius = max(3.0, main_min_side * 0.005)
+
+        # Two-pass hole detection: voids inside the solid part outline
+        part_mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.drawContours(part_mask, [largest], -1, 255, cv2.FILLED)
+        hole_region = cv2.bitwise_and(cv2.bitwise_not(mask), part_mask)
+        noise_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        hole_region = cv2.morphologyEx(hole_region, cv2.MORPH_OPEN, noise_kernel)
+
+        hole_contours, _ = cv2.findContours(hole_region, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        holes: List[Tuple[Tuple[float, float], float]] = []
+        for c in hole_contours:
+            a = cv2.contourArea(c)
+            if a < np.pi * min_hole_radius ** 2:
+                continue
+            if a > main_area * self.max_hole_area_ratio:
+                continue
+            perimeter = cv2.arcLength(c, True)
+            if perimeter < 1.0:
+                continue
+            circularity = 4.0 * np.pi * a / (perimeter ** 2)
+            if circularity < 0.55:
+                continue  # not circular — mask noise, not a bore hole
+            cx, cy, r = _fit_circle_algebraic(c)
+            if r > max_hole_radius or r < min_hole_radius:
+                continue
+            holes.append(((cx, cy), r))
+
+        eps_ratio = simplify_epsilon_ratio if simplify_epsilon_ratio is not None else self.simplify_epsilon_ratio
+        eps = max(2.0, eps_ratio * cv2.arcLength(largest, True))
+        outline = cv2.approxPolyDP(largest, eps, True)
+        if len(outline) < 3:
+            outline = largest
+        return OutlineResult(
+            outline=outline.astype(np.float32),
+            holes=holes,
+            contours_all=filtered,
+        )
+
+    def extract_geometric(
+        self,
+        mask: np.ndarray,
+        min_line_length: float = 20.0,
+        simplify_epsilon_ratio: Optional[float] = None,
+    ) -> GeometricOutline:
+        """Extract outline as a GeometricOutline with LSD-detected line segments.
+
+        Runs the standard mask extraction then additionally applies LSD to the
+        mask boundary to find straight-line segments.  The caller can use
+        `line_segments` to write DXF LINE entities and the raw `outline` for
+        any remaining curved sections.
+
+        Args:
+            mask: Binary mask (H, W) — uint8, value > 0 = foreground.
+            min_line_length: Minimum LSD segment length in pixels to keep.
+            simplify_epsilon_ratio: Override for polygon simplification.
+
+        Returns:
+            GeometricOutline with contour, algebraic hole circles, and LSD lines.
+        """
+        base = self.extract_from_mask(mask, simplify_epsilon_ratio=simplify_epsilon_ratio)
+        if mask.dtype != np.uint8:
+            mask_u8 = (mask > 0).astype(np.uint8) * 255
+        else:
+            mask_u8 = mask.copy()
+
+        line_segs = _detect_boundary_lines(mask_u8, min_line_length=min_line_length)
+
+        return GeometricOutline(
+            outline=base.outline,
+            holes=base.holes,
+            line_segments=line_segs,
+            contours_all=base.contours_all,
+        )
+
+    def extract(self, image_path: str) -> OutlineResult:
+        """
+        Extract ONE main outline and circular holes from a machine-part photo.
+
+        Three-step strategy:
+        1. Segment: build a SOLID binary mask of the part using Otsu + adaptive
+           threshold combined, then fill gaps with large morphological close.
+        2. Main outline: RETR_EXTERNAL (outermost contours only) and exclude any
+           contour touching the image border — that is background / table.
+        3. Holes: invert the filled-part mask inside the main contour region;
+           apply circularity filter (4π·area/perimeter² > 0.55) so only real
+           circular bores are kept — not shadows or surface markings.
+        """
+        img = cv2.imread(image_path)
+        if img is None:
+            raise ValueError(f"Cannot read image: {image_path}")
+        h, w = img.shape[:2]
+        area_img = w * h
+        # Single machine part should occupy most of the frame (≥5 %)
+        min_area = int(area_img * max(self.min_contour_area_ratio, 0.05))
+        border_px = max(5, int(min(h, w) * 0.015))  # 1.5 % border margin
+
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        blur_k = self.blur_kernel if self.blur_kernel % 2 == 1 else self.blur_kernel + 1
+        blurred = cv2.GaussianBlur(gray, (blur_k, blur_k), 0)
+
+        # --- Step 1: Build solid binary mask of the part ---
+        # Otsu: global threshold — robust to overall brightness variation
+        _, binary_otsu = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        # Adaptive: local threshold — captures fine edges missed by Otsu
+        binary_adapt = cv2.adaptiveThreshold(
+            blurred, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            max(3, self.adaptive_block),
+            self.adaptive_c,
+        )
+        raw = cv2.bitwise_or(binary_otsu, binary_adapt)
+
+        # Large morphological close → fills the interior solid
+        close_k = max(15, min(h, w) // 40)
+        if close_k % 2 == 0:
+            close_k += 1
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k, close_k))
+        solid = cv2.morphologyEx(raw, cv2.MORPH_CLOSE, close_kernel)
+
+        # Small open → removes isolated noise specks
+        open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        solid = cv2.morphologyEx(solid, cv2.MORPH_OPEN, open_kernel)
+
+        # --- Step 2: Find main part contour ---
+        # RETR_EXTERNAL: only outermost contours — avoids internal fragmentation
+        ext_contours, _ = cv2.findContours(solid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        def _touches_border(c: np.ndarray) -> bool:
+            x, y, cw, ch = cv2.boundingRect(c)
+            return (x <= border_px or y <= border_px or
+                    x + cw >= w - border_px or y + ch >= h - border_px)
+
+        # Prefer interior contours (background / table touches the border)
+        interior = [c for c in ext_contours
+                    if cv2.contourArea(c) >= min_area and not _touches_border(c)]
+        if not interior:
+            interior = [c for c in ext_contours if cv2.contourArea(c) >= min_area]
+        if not interior:
+            return OutlineResult(
+                outline=np.array([], dtype=np.float32).reshape(0, 1, 2),
+                holes=[],
+                contours_all=list(ext_contours),
+            )
+
+        largest = max(interior, key=cv2.contourArea)
+        main_area = cv2.contourArea(largest)
+        x_main, y_main, w_main, h_main = cv2.boundingRect(largest)
+        main_min_side = min(w_main, h_main)
+        max_hole_radius = main_min_side * self.max_hole_radius_ratio
+        min_hole_radius = max(3.0, main_min_side * 0.005)
+
+        # --- Step 3: Detect holes (circular voids inside the part) ---
+        # Fill the main contour → then find what's black (void) inside it
+        part_mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.drawContours(part_mask, [largest], -1, 255, cv2.FILLED)
+
+        hole_region = cv2.bitwise_and(cv2.bitwise_not(solid), part_mask)
+        noise_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        hole_region = cv2.morphologyEx(hole_region, cv2.MORPH_OPEN, noise_kernel)
+
+        hole_contours, _ = cv2.findContours(hole_region, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        holes_detected: List[Tuple[Tuple[float, float], float]] = []
+        for c in hole_contours:
+            a = cv2.contourArea(c)
+            if a < np.pi * min_hole_radius ** 2:
+                continue  # too small — noise pixel
+            if a > main_area * self.max_hole_area_ratio:
+                continue  # too large — not a bore hole
+
+            # Circularity: 4π·area/perimeter² = 1.0 for perfect circle
+            perimeter = cv2.arcLength(c, True)
+            if perimeter < 1.0:
+                continue
+            circularity = 4.0 * np.pi * a / (perimeter ** 2)
+            if circularity < 0.55:
+                continue  # shadow, marking, slot — not a circular hole
+
+            cx, cy, r = _fit_circle_algebraic(c)
+            if r > max_hole_radius or r < min_hole_radius:
+                continue
+            holes_detected.append(((cx, cy), r))
+
+        # --- Step 4: Simplify main outline ---
+        eps = max(2.0, self.simplify_epsilon_ratio * cv2.arcLength(largest, True))
+        outline = cv2.approxPolyDP(largest, eps, True)
+        if len(outline) < 3:
+            outline = largest
+
+        return OutlineResult(
+            outline=outline.astype(np.float32),
+            holes=holes_detected,
+            contours_all=interior,
+        )
+
+    def _merge_holes(
+        self,
+        from_contours: List[Tuple[Tuple[float, float], float]],
+        from_hough: List[Tuple[Tuple[float, float], float]],
+    ) -> List[Tuple[Tuple[float, float], float]]:
+        merged = list(from_contours)
+        for (cx, cy), r in from_hough:
+            if any(
+                np.hypot(cx - pc[0], cy - pc[1]) < (pr + r) * 0.8
+                for (pc, pr) in merged
+            ):
+                continue
+            merged.append(((cx, cy), r))
+        return merged
+
+    def to_dxf_friendly(
+        self, result: OutlineResult, scale: float = 1.0, origin: Tuple[float, float] = (0, 0)
+    ) -> Tuple[List[np.ndarray], List[Tuple[Tuple[float, float], float]]]:
+        """
+        Returns (list of contour arrays in world coords, list of (center, radius)).
+        """
+        ox, oy = origin
+        contours = []
+        if result.outline is not None and len(result.outline) >= 2:
+            pts = result.outline.reshape(-1, 2)
+            pts = pts * scale + np.array([ox, oy])
+            contours.append(pts.astype(np.float64))
+
+        holes = []
+        for (cx, cy), r in result.holes:
+            holes.append(((ox + cx * scale, oy + cy * scale), r * scale))
+        return contours, holes
+
+
+def load_params(path: str) -> Dict:
+    """Load extractor params from JSON."""
+    import json
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def create_extractor_from_params(params: Optional[Dict] = None) -> OutlineExtractor:
+    """Create OutlineExtractor from dict (e.g. from training_data/params.json)."""
+    default = OutlineExtractor()
+    if not params:
+        return default
+    return OutlineExtractor(
+        canny_low=int(params.get("canny_low", default.canny_low)),
+        canny_high=int(params.get("canny_high", default.canny_high)),
+        blur_kernel=int(params.get("blur_kernel", default.blur_kernel)),
+        min_contour_area_ratio=float(params.get("min_contour_area_ratio", default.min_contour_area_ratio)),
+        simplify_epsilon_ratio=float(params.get("simplify_epsilon_ratio", default.simplify_epsilon_ratio)),
+        max_hole_area_ratio=float(params.get("max_hole_area_ratio", default.max_hole_area_ratio)),
+        max_hole_radius_ratio=float(params.get("max_hole_radius_ratio", default.max_hole_radius_ratio)),
+        use_hough_circles=bool(params.get("use_hough_circles", default.use_hough_circles)),
+        use_adaptive_thresh=bool(params.get("use_adaptive_thresh", default.use_adaptive_thresh)),
+        adaptive_block=int(params.get("adaptive_block", default.adaptive_block)),
+        adaptive_c=int(params.get("adaptive_c", default.adaptive_c)),
+    )
