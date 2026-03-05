@@ -43,7 +43,6 @@ uploads/
 
 # Data
 data/
-models/
 *.pth
 *.pt
 *.h5
