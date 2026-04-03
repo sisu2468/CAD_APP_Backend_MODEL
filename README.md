@@ -30,7 +30,7 @@ pip install -r requirements.txt
 
 Process a single image:
 ```bash
-python main.py IMG_8840.jpg -n output_drawing
+python main.py IMG_5047.jpg -n output_drawing
 ```
 
 Process multiple views:

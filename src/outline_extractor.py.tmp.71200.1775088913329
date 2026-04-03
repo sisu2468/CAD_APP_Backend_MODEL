@@ -304,8 +304,8 @@ class OutlineExtractor:
         holes: List[Tuple[Tuple[float, float], float]] = []
         seen_centers: List[Tuple[float, float, float]] = []  # (cx, cy, r) dedup list
 
-        # Tighter param2 = fewer false positives; three levels to handle varying contrast
-        for param1, param2 in [(80, 35), (60, 30), (50, 25)]:
+        # Try two param1 values: lower catches faint circles (shallow bores, through-holes)
+        for param1, param2 in [(60, 25), (40, 20), (80, 30)]:
             raw = cv2.HoughCircles(
                 blurred,
                 cv2.HOUGH_GRADIENT,
@@ -340,27 +340,8 @@ class OutlineExtractor:
                 outer_px = gray[ring_mask > 0]
                 if len(inner_px) < 5 or len(outer_px) < 5:
                     continue
-                # Accept if:
-                # 1. Inner ≥30 intensity units darker than surrounding ring
-                # 2. Inner mean < 55% of overall part mean (true through-hole ≈ black)
-                # 3. Inner mean absolutely dark (< 90 / 255)
-                # 4. The ring boundary around the hole is ≥80% inside the part mask
-                #    (eliminates openings at the part perimeter, e.g. V-groove edges)
-                part_mean = float(gray[part_mask > 0].mean())
-                inner_mean = float(inner_px.mean())
-                outer_mean = float(outer_px.mean())
-
-                boundary_ring = np.zeros((h, w), dtype=np.uint8)
-                cv2.circle(boundary_ring, (cx_c, cy_c), int(r * 1.3), 255, -1)
-                cv2.circle(boundary_ring, (cx_c, cy_c), int(r * 0.9), 0, -1)
-                ring_total = float(boundary_ring.sum()) / 255.0
-                ring_in_part = float(((boundary_ring > 0) & (part_mask > 0)).sum())
-                boundary_coverage = ring_in_part / max(1.0, ring_total)
-
-                if (inner_mean < outer_mean - 30
-                        and inner_mean < part_mean * 0.55
-                        and inner_mean < 90
-                        and boundary_coverage >= 0.80):
+                # Accept if inner is at least 15 intensity units darker than outer ring
+                if float(inner_px.mean()) < float(outer_px.mean()) - 15:
                     seen_centers.append((float(cx), float(cy), float(r)))
                     holes.append(((float(cx), float(cy)), float(r)))
 

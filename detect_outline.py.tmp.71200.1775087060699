@@ -1,0 +1,147 @@
+"""
+Standalone outline detection script.
+
+Usage:
+    python detect_outline.py photo.jpg
+    python detect_outline.py photo.jpg --debug            # save debug overlay image
+    python detect_outline.py photo.jpg --output out.dxf   # also export DXF
+    python detect_outline.py photo.jpg --no-grabcut       # skip GrabCut (faster)
+
+The script prints detected hole count + outline point count to stdout and
+optionally saves a debug visualisation showing the segmentation overlay.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+
+def _detect(image_path: str, use_grabcut: bool = True) -> dict:
+    """Run full outline detection and return a result dict."""
+    from src.segmentation import RobustPartSegmentor
+    from src.outline_extractor import OutlineExtractor
+
+    segmentor = RobustPartSegmentor(use_grabcut=use_grabcut, grabcut_iterations=5)
+    img, mask = segmentor.segment_from_path(image_path)
+
+    extractor = OutlineExtractor()
+    result = extractor.extract_from_mask(mask)
+
+    return {
+        "img": img,
+        "mask": mask,
+        "outline": result.outline,
+        "holes": result.holes,
+        "contours_all": result.contours_all,
+    }
+
+
+def _save_debug(image_path: str, result: dict, output_path: str) -> None:
+    """Save side-by-side debug image: original | mask | overlay."""
+    img = result["img"]
+    mask = result["mask"]
+    outline = result["outline"]
+    holes = result["holes"]
+
+    h, w = img.shape[:2]
+
+    # --- Overlay panel ---
+    overlay = img.copy()
+    # Green fill for segmented part
+    overlay[mask > 0] = (
+        overlay[mask > 0].astype(np.float32) * 0.55
+        + np.array([0, 180, 0], dtype=np.float32) * 0.45
+    ).astype(np.uint8)
+
+    # Red outline contour
+    if outline is not None and len(outline) >= 2:
+        pts = outline.reshape(-1, 1, 2).astype(np.int32)
+        cv2.polylines(overlay, [pts], isClosed=True, color=(0, 0, 255), thickness=2)
+
+    # Blue circles for holes
+    for (cx, cy), r in holes:
+        cv2.circle(overlay, (int(cx), int(cy)), int(r), (255, 80, 0), 2)
+        cv2.circle(overlay, (int(cx), int(cy)), 3, (255, 80, 0), -1)
+
+    # --- Labels ---
+    def _label(panel: np.ndarray, text: str) -> None:
+        cv2.putText(panel, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.9, (0, 255, 255), 2, cv2.LINE_AA)
+
+    mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+    _label(img.copy(), "Original")
+    _label(mask_bgr, "Mask")
+    _label(overlay, f"Outline pts:{len(outline) if outline is not None else 0}  holes:{len(holes)}")
+
+    orig_labeled = img.copy()
+    _label(orig_labeled, "Original")
+    _label(mask_bgr, "Mask")
+
+    debug = np.hstack([orig_labeled, mask_bgr, overlay])
+    cv2.imwrite(output_path, debug)
+    print(f"Debug image saved: {output_path}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Detect machine-part outline from a photo")
+    parser.add_argument("image", help="Input image path")
+    parser.add_argument("--debug", action="store_true",
+                        help="Save debug overlay image next to input")
+    parser.add_argument("--debug-out", default=None,
+                        help="Path for debug image (default: <input>_debug.jpg)")
+    parser.add_argument("--output", "-o", default=None,
+                        help="Export DXF to this path")
+    parser.add_argument("--no-grabcut", action="store_true",
+                        help="Skip GrabCut refinement (faster, slightly less accurate)")
+    args = parser.parse_args()
+
+    if not Path(args.image).exists():
+        print(f"ERROR: image not found: {args.image}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Processing: {args.image}")
+    use_grabcut = not args.no_grabcut
+    result = _detect(args.image, use_grabcut=use_grabcut)
+
+    outline = result["outline"]
+    holes = result["holes"]
+    n_pts = len(outline) if outline is not None else 0
+    print(f"  Outline points : {n_pts}")
+    print(f"  Holes detected : {len(holes)}")
+    for i, ((cx, cy), r) in enumerate(holes, 1):
+        print(f"    hole {i}: center=({cx:.1f}, {cy:.1f})  radius={r:.1f} px")
+
+    if n_pts == 0:
+        print("WARNING: No outline detected — check lighting / background contrast.")
+
+    if args.debug or args.debug_out:
+        debug_path = args.debug_out or str(
+            Path(args.image).with_name(Path(args.image).stem + "_debug.jpg")
+        )
+        _save_debug(args.image, result, debug_path)
+
+    if args.output:
+        from src.outline_extractor import OutlineExtractor, OutlineResult
+        from src.cad_generator import CADGenerator
+
+        ext = OutlineExtractor()
+        outline_result = OutlineResult(
+            outline=result["outline"],
+            holes=result["holes"],
+            contours_all=result["contours_all"],
+        )
+        contours, holes_dxf = ext.to_dxf_friendly(outline_result, scale=1.0)
+        gen = CADGenerator()
+        gen.create_drawing()
+        gen.add_outline(contours, holes_dxf, offset=(0, 0))
+        gen.save(args.output)
+        print(f"DXF saved: {args.output}")
+
+
+if __name__ == "__main__":
+    main()

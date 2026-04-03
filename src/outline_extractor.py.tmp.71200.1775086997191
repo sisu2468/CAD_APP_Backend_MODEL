@@ -270,184 +270,126 @@ class OutlineExtractor:
             contours_all=base.contours_all,
         )
 
-    def _find_holes_from_image(
-        self,
-        img: np.ndarray,
-        part_mask: np.ndarray,
-        part_area: float,
-        main_min_side: float,
-    ) -> List[Tuple[Tuple[float, float], float]]:
-        """Detect circular holes using Hough circles on the original image inside the part.
-
-        Hough circle detection works directly on the gradient structure of the image,
-        so it finds real circular holes even when surface texture/rust creates large
-        non-circular dark regions that fool simple thresholding approaches.
-
-        Falls back to contour-based detection for any remaining circles not found by Hough.
+    def extract(self, image_path: str) -> OutlineResult:
         """
+        Extract ONE main outline and circular holes from a machine-part photo.
+
+        Three-step strategy:
+        1. Segment: build a SOLID binary mask of the part using Otsu + adaptive
+           threshold combined, then fill gaps with large morphological close.
+        2. Main outline: RETR_EXTERNAL (outermost contours only) and exclude any
+           contour touching the image border — that is background / table.
+        3. Holes: invert the filled-part mask inside the main contour region;
+           apply circularity filter (4π·area/perimeter² > 0.55) so only real
+           circular bores are kept — not shadows or surface markings.
+        """
+        img = cv2.imread(image_path)
+        if img is None:
+            raise ValueError(f"Cannot read image: {image_path}")
+        h, w = img.shape[:2]
+        area_img = w * h
+        # Single machine part should occupy most of the frame (≥5 %)
+        min_area = int(area_img * max(self.min_contour_area_ratio, 0.05))
+        border_px = max(5, int(min(h, w) * 0.015))  # 1.5 % border margin
+
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        h, w = gray.shape
-        max_hole_radius = int(main_min_side * self.max_hole_radius_ratio)
-        min_hole_radius = max(5, int(main_min_side * 0.01))
+        blur_k = self.blur_kernel if self.blur_kernel % 2 == 1 else self.blur_kernel + 1
+        blurred = cv2.GaussianBlur(gray, (blur_k, blur_k), 0)
 
-        # --- Method 1: Hough Circle Transform ---
-        # Apply CLAHE inside the part to enhance local contrast for circle detection
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(gray)
+        # --- Step 1: Build solid binary mask of the part ---
+        # Otsu: global threshold — robust to overall brightness variation
+        _, binary_otsu = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        # Adaptive: local threshold — captures fine edges missed by Otsu
+        binary_adapt = cv2.adaptiveThreshold(
+            blurred, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            max(3, self.adaptive_block),
+            self.adaptive_c,
+        )
+        raw = cv2.bitwise_or(binary_otsu, binary_adapt)
 
-        # Mask outside-part area to 128 (neutral) so border doesn't create ghost circles
-        enhanced_masked = np.full_like(enhanced, 128)
-        enhanced_masked[part_mask > 0] = enhanced[part_mask > 0]
+        # Large morphological close → fills the interior solid
+        close_k = max(15, min(h, w) // 40)
+        if close_k % 2 == 0:
+            close_k += 1
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k, close_k))
+        solid = cv2.morphologyEx(raw, cv2.MORPH_CLOSE, close_kernel)
 
-        blurred = cv2.GaussianBlur(enhanced_masked, (9, 9), 2)
+        # Small open → removes isolated noise specks
+        open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        solid = cv2.morphologyEx(solid, cv2.MORPH_OPEN, open_kernel)
 
-        holes: List[Tuple[Tuple[float, float], float]] = []
-        seen_centers: List[Tuple[float, float, float]] = []  # (cx, cy, r) dedup list
+        # --- Step 2: Find main part contour ---
+        # RETR_EXTERNAL: only outermost contours — avoids internal fragmentation
+        ext_contours, _ = cv2.findContours(solid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        # Tighter param2 = fewer false positives; three levels to handle varying contrast
-        for param1, param2 in [(80, 35), (60, 30), (50, 25)]:
-            raw = cv2.HoughCircles(
-                blurred,
-                cv2.HOUGH_GRADIENT,
-                dp=1.2,
-                minDist=max(min_hole_radius * 2, 20),
-                param1=param1,
-                param2=param2,
-                minRadius=min_hole_radius,
-                maxRadius=max_hole_radius,
+        def _touches_border(c: np.ndarray) -> bool:
+            x, y, cw, ch = cv2.boundingRect(c)
+            return (x <= border_px or y <= border_px or
+                    x + cw >= w - border_px or y + ch >= h - border_px)
+
+        # Prefer interior contours (background / table touches the border)
+        interior = [c for c in ext_contours
+                    if cv2.contourArea(c) >= min_area and not _touches_border(c)]
+        if not interior:
+            interior = [c for c in ext_contours if cv2.contourArea(c) >= min_area]
+        if not interior:
+            return OutlineResult(
+                outline=np.array([], dtype=np.float32).reshape(0, 1, 2),
+                holes=[],
+                contours_all=list(ext_contours),
             )
-            if raw is None:
-                continue
-            for cx, cy, r in np.round(raw[0]).astype(int):
-                # Centre must be inside the part mask
-                cy_c = max(0, min(h - 1, int(cy)))
-                cx_c = max(0, min(w - 1, int(cx)))
-                if part_mask[cy_c, cx_c] == 0:
-                    continue
-                # Deduplicate: skip if too close to an already-accepted circle
-                if any(np.hypot(cx - ex, cy - ey) < (r + er) * 0.6
-                       for ex, ey, er in seen_centers):
-                    continue
-                # Validate: the region inside the circle should be darker than surroundings
-                circle_mask = np.zeros((h, w), dtype=np.uint8)
-                cv2.circle(circle_mask, (cx_c, cy_c), max(1, int(r * 0.7)), 255, -1)
-                ring_mask = np.zeros((h, w), dtype=np.uint8)
-                cv2.circle(ring_mask, (cx_c, cy_c), int(r * 1.3), 255, -1)
-                cv2.circle(ring_mask, (cx_c, cy_c), int(r * 0.9), 0, -1)
-                ring_mask = cv2.bitwise_and(ring_mask, part_mask)
 
-                inner_px = gray[circle_mask > 0]
-                outer_px = gray[ring_mask > 0]
-                if len(inner_px) < 5 or len(outer_px) < 5:
-                    continue
-                # Accept if:
-                # 1. Inner ≥30 intensity units darker than surrounding ring
-                # 2. Inner mean < 55% of overall part mean (true through-hole ≈ black)
-                # 3. Inner mean absolutely dark (< 90 / 255)
-                # 4. The ring boundary around the hole is ≥80% inside the part mask
-                #    (eliminates openings at the part perimeter, e.g. V-groove edges)
-                part_mean = float(gray[part_mask > 0].mean())
-                inner_mean = float(inner_px.mean())
-                outer_mean = float(outer_px.mean())
+        largest = max(interior, key=cv2.contourArea)
+        main_area = cv2.contourArea(largest)
+        x_main, y_main, w_main, h_main = cv2.boundingRect(largest)
+        main_min_side = min(w_main, h_main)
+        max_hole_radius = main_min_side * self.max_hole_radius_ratio
+        min_hole_radius = max(3.0, main_min_side * 0.005)
 
-                boundary_ring = np.zeros((h, w), dtype=np.uint8)
-                cv2.circle(boundary_ring, (cx_c, cy_c), int(r * 1.3), 255, -1)
-                cv2.circle(boundary_ring, (cx_c, cy_c), int(r * 0.9), 0, -1)
-                ring_total = float(boundary_ring.sum()) / 255.0
-                ring_in_part = float(((boundary_ring > 0) & (part_mask > 0)).sum())
-                boundary_coverage = ring_in_part / max(1.0, ring_total)
+        # --- Step 3: Detect holes (circular voids inside the part) ---
+        # Fill the main contour → then find what's black (void) inside it
+        part_mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.drawContours(part_mask, [largest], -1, 255, cv2.FILLED)
 
-                if (inner_mean < outer_mean - 30
-                        and inner_mean < part_mean * 0.55
-                        and inner_mean < 90
-                        and boundary_coverage >= 0.80):
-                    seen_centers.append((float(cx), float(cy), float(r)))
-                    holes.append(((float(cx), float(cy)), float(r)))
+        hole_region = cv2.bitwise_and(cv2.bitwise_not(solid), part_mask)
+        noise_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        hole_region = cv2.morphologyEx(hole_region, cv2.MORPH_OPEN, noise_kernel)
 
-        if holes:
-            return holes
+        hole_contours, _ = cv2.findContours(hole_region, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        # --- Method 2: Contour-based fallback (for very large or faint circles) ---
-        # Use a much stricter low-threshold to find only very dark voids
-        part_pixels = gray[part_mask > 0].astype(np.uint8)
-        if len(part_pixels) < 20:
-            return []
-
-        # Use bottom 15th percentile as dark threshold (captures real holes, not texture)
-        dark_thresh = int(np.percentile(part_pixels, 15))
-        dark_map = np.zeros((h, w), dtype=np.uint8)
-        inside = part_mask > 0
-        dark_map[inside] = np.where(gray[inside] <= dark_thresh, 255, 0)
-
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        dark_map = cv2.morphologyEx(dark_map, cv2.MORPH_OPEN, k)
-        dark_map = cv2.morphologyEx(dark_map, cv2.MORPH_CLOSE, k)
-
-        hole_contours, _ = cv2.findContours(dark_map, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        holes_detected: List[Tuple[Tuple[float, float], float]] = []
         for c in hole_contours:
             a = cv2.contourArea(c)
             if a < np.pi * min_hole_radius ** 2:
-                continue
-            if a > part_area * self.max_hole_area_ratio:
-                continue
+                continue  # too small — noise pixel
+            if a > main_area * self.max_hole_area_ratio:
+                continue  # too large — not a bore hole
+
+            # Circularity: 4π·area/perimeter² = 1.0 for perfect circle
             perimeter = cv2.arcLength(c, True)
             if perimeter < 1.0:
                 continue
             circularity = 4.0 * np.pi * a / (perimeter ** 2)
             if circularity < 0.55:
-                continue
+                continue  # shadow, marking, slot — not a circular hole
+
             cx, cy, r = _fit_circle_algebraic(c)
             if r > max_hole_radius or r < min_hole_radius:
                 continue
-            holes.append(((cx, cy), r))
-        return holes
+            holes_detected.append(((cx, cy), r))
 
-    def extract(self, image_path: str) -> OutlineResult:
-        """Extract ONE main outline and circular holes from a machine-part photo.
-
-        Uses RobustPartSegmentor (multi-strategy + GrabCut) for >90% accuracy.
-        Hole detection works directly on the original image inside the part region,
-        because the segmentor produces a solid (hole-filled) part mask.
-        """
-        img = cv2.imread(image_path)
-        if img is None:
-            raise ValueError(f"Cannot read image: {image_path}")
-
-        segmentor = RobustPartSegmentor(use_grabcut=True, grabcut_iterations=5)
-        mask = segmentor.segment(img)
-
-        if mask.sum() == 0:
-            logger.warning("Segmentation returned empty mask for %s", image_path)
-            return OutlineResult(
-                outline=np.array([], dtype=np.float32).reshape(0, 1, 2),
-                holes=[],
-                contours_all=[],
-            )
-
-        # --- Outline from solid mask ---
-        base = self.extract_from_mask(mask, simplify_epsilon_ratio=self.simplify_epsilon_ratio)
-
-        # --- Hole detection from original image inside the part mask ---
-        # (extract_from_mask sees no voids because the mask is solid-filled)
-        if base.outline is not None and len(base.outline) >= 3:
-            # Build part_mask from the detected contour for accurate hole region
-            h, w = img.shape[:2]
-            ext_contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if ext_contours:
-                largest_c = max(ext_contours, key=cv2.contourArea)
-                part_area = cv2.contourArea(largest_c)
-                x, y, bw, bh = cv2.boundingRect(largest_c)
-                main_min_side = float(min(bw, bh))
-                holes = self._find_holes_from_image(img, mask, part_area, main_min_side)
-            else:
-                holes = []
-        else:
-            holes = base.holes  # fallback to whatever extract_from_mask found
+        # --- Step 4: Simplify main outline ---
+        eps = max(2.0, self.simplify_epsilon_ratio * cv2.arcLength(largest, True))
+        outline = cv2.approxPolyDP(largest, eps, True)
+        if len(outline) < 3:
+            outline = largest
 
         return OutlineResult(
-            outline=base.outline,
-            holes=holes,
-            contours_all=base.contours_all,
+            outline=outline.astype(np.float32),
+            holes=holes_detected,
+            contours_all=interior,
         )
 
     def _merge_holes(
